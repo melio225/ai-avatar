@@ -6,11 +6,6 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
 
-import {
-    VRMLoaderPlugin,
-    VRMUtils
-} from '@pixiv/three-vrm'
-
 // Your project already has this at src/assets/EAH_Logo.png
 import eahLogoUrl from './assets/EAH_Logo.png'
 
@@ -262,6 +257,7 @@ const renderer = new THREE.WebGLRenderer({ antialias: true })
 
 renderer.setSize(window.innerWidth, window.innerHeight)
 renderer.setPixelRatio(window.devicePixelRatio)
+renderer.outputColorSpace = THREE.SRGBColorSpace
 
 document.body.appendChild(renderer.domElement)
 
@@ -287,50 +283,70 @@ scene.add(new THREE.AmbientLight(0xffffff, 1))
 
 
 // ======================
-// VRM Loading
+// Avatar loading (plain glTF — no VRM plugin)
 // ======================
+//
+// This model (avatar_3.glb) is NOT a VRM file, so there's no humanoid/
+// expressionManager API to lean on. Instead:
+//  - Bones are looked up directly by name from the skeleton (Mixamo/
+//    Ready-Player-Me-style naming: LeftArm, RightForeArm, etc.)
+//  - Facial animation runs through real ARKit-style morph targets
+//    (eyeBlinkLeft, jawOpen, mouthSmileLeft, ...) found on the
+//    AvatarHead / AvatarEyelashes / AvatarTeethLower meshes.
+//
+// Put the file at: public/models/avatar_3.glb  (Vite serves /public at
+// the site root, so the load path below is correct as long as it's there)
 
-let currentVrm = null
+let currentAvatarRoot = null
+let headMesh = null
+let eyelashMesh = null
+let teethLowerMesh = null
 
 const loader = new GLTFLoader()
 
-loader.register((parser) => new VRMLoaderPlugin(parser))
-
 loader.load(
-    '/models/avatar_2.vrm',
+    '/models/avatar_3.glb',
     (gltf) => {
-        const vrm = gltf.userData.vrm
+        currentAvatarRoot = gltf.scene
 
-        VRMUtils.rotateVRM0(vrm)
+        scene.add(gltf.scene)
 
-        currentVrm = vrm
+        // This rig may face the opposite way from what you expect by
+        // default — if the avatar loads facing AWAY from the camera,
+        // this flip fixes it. If it loads facing the WRONG way after
+        // this, just delete the next line.
+        // This rig conventionally faces +Z in its bind pose, which already
+        // points toward the camera in this scene's default setup — so no
+        // rotation flip needed here. If she still faces away, uncomment:
+        // gltf.scene.rotation.y = Math.PI
+        gltf.scene.position.set(0, 0, 0)
 
-        scene.add(vrm.scene)
+        // Find the meshes that carry facial morph targets
+        gltf.scene.traverse((obj) => {
+            if (!obj.isMesh) return
+            if (obj.name === 'AvatarHead') headMesh = obj
+            if (obj.name === 'AvatarEyelashes') eyelashMesh = obj
+            if (obj.name === 'AvatarTeethLower') teethLowerMesh = obj
+        })
 
-        vrm.scene.rotation.y = Math.PI
-        vrm.scene.position.set(0, 0, 0)
+        setIdlePose(gltf.scene)
 
-        if (vrm.humanoid) {
-            vrm.humanoid.resetNormalizedPose()
-            setIdlePose(vrm)
-        }
-
-        console.log("Avatar loaded!", vrm)
+        console.log("Avatar loaded!", gltf)
 
         hideLoadingOverlay()
-        startIdleBlinking(vrm)
+        startIdleBlinking()
 
         // Greet once loaded and voices are ready
         whenVoicesReady(() => {
             setTimeout(() => {
-                triggerWaveGesture()
+                triggerWelcomeGesture()
                 speak("Hello, how can I assist you today? I'm the virtual assistant for EAH Jena.")
             }, 800)
         })
     },
     undefined,
     (error) => {
-        console.error("VRM loading error:", error)
+        console.error("Avatar loading error:", error)
     }
 )
 
@@ -339,48 +355,51 @@ loader.load(
 // Idle pose (fixes the default T-pose)
 // ======================
 //
-// VRM models load in their raw bind pose, which is almost always a T-pose.
-// There's no built-in "idle" pose — you either rotate bones manually (quick,
-// what we do here) or play an idle animation clip (.vrma / retargeted mixamo
-// fbx via an AnimationMixer, which looks more natural but takes more setup).
-//
-// If the arms rotate the WRONG way for your model (some rigs are mirrored),
-// just flip the sign on the rotation.z values below.
+// This rig's bind pose is a T-pose too, same issue as before — but
+// unlike VRM, there's no "normalized" bone space here, so the correct
+// axis/sign to lower the arms is specific to THIS rig. rotation.z is
+// the most common convention for Mixamo/RPM-style rigs and is the best
+// first guess, but if the arms don't move — or move the wrong way —
+// open your browser console and try:
+//   currentAvatarRoot.getObjectByName('LeftArm').rotation.x = 1
+// (swap .x for .y or .z, and try positive/negative) until you find the
+// axis that lowers the arm, then update the values below to match.
 
 // Filled in by setIdlePose, read every frame by applyIdleSway / applyGesture
 let idleBones = {}
 let idleBase = {}
 
-function setIdlePose(vrm) {
-    if (!vrm.humanoid) return
-
+function setIdlePose(root) {
     const bones = {
-        leftUpperArm: vrm.humanoid.getNormalizedBoneNode('leftUpperArm'),
-        rightUpperArm: vrm.humanoid.getNormalizedBoneNode('rightUpperArm'),
-        leftLowerArm: vrm.humanoid.getNormalizedBoneNode('leftLowerArm'),
-        rightLowerArm: vrm.humanoid.getNormalizedBoneNode('rightLowerArm'),
-        leftHand: vrm.humanoid.getNormalizedBoneNode('leftHand'),
-        rightHand: vrm.humanoid.getNormalizedBoneNode('rightHand'),
-        // Not every VRM model rigs individual fingers — these are optional
-        leftIndexProximal: vrm.humanoid.getNormalizedBoneNode('leftIndexProximal'),
-        rightIndexProximal: vrm.humanoid.getNormalizedBoneNode('rightIndexProximal'),
-        leftMiddleProximal: vrm.humanoid.getNormalizedBoneNode('leftMiddleProximal'),
-        rightMiddleProximal: vrm.humanoid.getNormalizedBoneNode('rightMiddleProximal')
+        leftUpperArm: root.getObjectByName('LeftArm'),
+        rightUpperArm: root.getObjectByName('RightArm'),
+        leftLowerArm: root.getObjectByName('LeftForeArm'),
+        rightLowerArm: root.getObjectByName('RightForeArm'),
+        leftHand: root.getObjectByName('LeftHand'),
+        rightHand: root.getObjectByName('RightHand'),
+        // Proximal finger bones — this rig has full finger chains
+        leftIndexProximal: root.getObjectByName('LeftHandIndex1'),
+        rightIndexProximal: root.getObjectByName('RightHandIndex1'),
+        leftMiddleProximal: root.getObjectByName('LeftHandMiddle1'),
+        rightMiddleProximal: root.getObjectByName('RightHandMiddle1')
     }
 
-    // Bring upper arms down from horizontal (T-pose) to roughly vertical
-    if (bones.leftUpperArm) bones.leftUpperArm.rotation.z = Math.PI * 0.42
-    if (bones.rightUpperArm) bones.rightUpperArm.rotation.z = -Math.PI * 0.42
+    // Bring upper arms down from horizontal (T-pose) toward the sides.
+    // All four values below were found live via the pose tuner (press P)
+    // — this is the actual working rest pose for THIS rig, not a guess.
+    if (bones.leftUpperArm) bones.leftUpperArm.rotation.set(1.55, -0.01, -0.02)
+    if (bones.rightUpperArm) bones.rightUpperArm.rotation.set(1.51, 0.01, 0.05)
 
-    // Slight bend at the elbow so it doesn't look robotic
-    if (bones.leftLowerArm) bones.leftLowerArm.rotation.y = -0.15
-    if (bones.rightLowerArm) bones.rightLowerArm.rotation.y = 0.15
+    // Slight bend at the elbow so it doesn't look robotic — also tuned live
+    if (bones.leftLowerArm) bones.leftLowerArm.rotation.set(-0.10, -0.14, 0.20)
+    if (bones.rightLowerArm) bones.rightLowerArm.rotation.set(-0.05, 0.12, -0.35)
 
     // Relax the hands slightly too
     if (bones.leftHand) bones.leftHand.rotation.z = 0.05
     if (bones.rightHand) bones.rightHand.rotation.z = -0.05
 
     idleBones = bones
+    window.idleBones = bones // handy for manual console testing, e.g. idleBones.rightHand.rotation.z = 1
 
     // Snapshot this resting pose — sway and gestures animate AROUND these
     // values rather than replacing them, so the avatar always settles
@@ -427,7 +446,7 @@ function applyIdleSway(elapsed) {
         b.rightHand.rotation.x = Math.sin(elapsed * 0.38 + 1) * 0.04
     }
 
-    // Fingers, if the rig has them — a very subtle curl drift
+    // Fingers — a very subtle curl drift
     if (b.leftIndexProximal) b.leftIndexProximal.rotation.x = 0.05 + Math.sin(elapsed * 0.7) * 0.03
     if (b.rightIndexProximal) b.rightIndexProximal.rotation.x = 0.05 + Math.sin(elapsed * 0.72 + 2.4) * 0.03
     if (b.leftMiddleProximal) b.leftMiddleProximal.rotation.x = 0.05 + Math.sin(elapsed * 0.65 + 1) * 0.03
@@ -436,18 +455,21 @@ function applyIdleSway(elapsed) {
 
 
 // ======================
-// One-off gestures (e.g. a wave on greeting)
+// One-off gestures ("hi from far away" wave on greeting)
 // ======================
 //
 // Runs on top of idle sway for a fixed duration, then hands control back.
-// If the wave lifts the wrong arm or bends the wrong way on your rig,
-// flip the signs the same way as in setIdlePose above.
+// A big ~180° swing of the forearm (rotation.z on rightLowerArm — the
+// axis your tuning showed carries the elbow bend on this rig) plus a
+// side-to-side wag at the wrist once it's up. Deliberately NOT a forward
+// reach — the upper arm never moves, so it doesn't read as a handshake.
+// If the arm swings the wrong way, flip the sign on `Math.PI` below.
 
 let activeGesture = null // { type, startTime, duration }
 
-function triggerWaveGesture() {
-    if (!idleBones.rightUpperArm) return
-    activeGesture = { type: 'wave', startTime: clock.getElapsedTime(), duration: 1.8 }
+function triggerWelcomeGesture() {
+    if (!idleBones.rightLowerArm) return
+    activeGesture = { type: 'welcome', startTime: clock.getElapsedTime(), duration: 2.8 }
 }
 
 function applyActiveGesture() {
@@ -460,43 +482,202 @@ function applyActiveGesture() {
         return
     }
 
-    if (activeGesture.type === 'wave') {
+    if (activeGesture.type === 'welcome') {
         const b = idleBones
         const base = idleBase
-        // Ease the arm up over the first 0.4s, hold, then let the
-        // duration cutoff above return control to idle sway.
-        const lift = Math.min(t / 0.4, 1)
 
-        if (b.rightUpperArm && base.rightUpperArm) {
-            b.rightUpperArm.rotation.z = base.rightUpperArm.z - lift * 1.1
-            b.rightUpperArm.rotation.x = base.rightUpperArm.x - lift * 0.25
+        // Rise, hold, then FALL back to 0 over the final stretch — lift
+        // returns to exactly 0 by the time the gesture ends, so the
+        // handoff back to idle sway is seamless instead of a jump-cut.
+        const riseTime = 0.7
+        const fallTime = 0.6
+        const fallStart = activeGesture.duration - fallTime
+
+        let lift
+        if (t < riseTime) {
+            lift = t / riseTime
+        } else if (t < fallStart) {
+            lift = 1
+        } else {
+            lift = Math.max(0, (activeGesture.duration - t) / fallTime)
         }
+        // Ease (smoothstep) instead of linear, so the swing itself feels
+        // less mechanical
+        const eased = lift * lift * (3 - 2 * lift)
+
         if (b.rightLowerArm && base.rightLowerArm) {
-            b.rightLowerArm.rotation.y = base.rightLowerArm.y - lift * 0.5
+            // ~130° swing (130° × π/180 ≈ 2.27 rad) — big enough to read
+            // from across a room, without the full 180° being too much
+            b.rightLowerArm.rotation.z = base.rightLowerArm.z - eased * 2.27
         }
-        if (b.rightHand) {
-            // wrist wave, ramping in with `lift`
-            b.rightHand.rotation.z = Math.sin(t * 9) * 0.3 * lift
+
+        // Rotate the palm to face the camera (not sideways) once raised,
+        // plus a side-to-side wag at the wrist — the actual "waving"
+        // motion, layered on top of the raise. rotation.y is the best
+        // guess for the hand's roll/twist axis — if the palm still
+        // doesn't face forward, try flipping the sign, or swap .y for .x
+        // and test live via: window.idleBones.rightHand.rotation.y = 1.4
+        if (b.rightHand && base.rightHand) {
+            const wag = Math.sin(t * 6) * 0.4 
+            const palmFacing = eased * -1.4 
+            b.rightHand.rotation.z = base.rightHand.z + wag 
+            b.rightHand.rotation.y = base.rightHand.y + palmFacing
         }
     }
 }
 
 
 // ======================
+// Facial animation helper
+// ======================
+//
+// Sets a named morph target's influence across every mesh that has it.
+// Different meshes carry different subsets (e.g. only AvatarHead and
+// AvatarTeethLower have jawOpen — AvatarTeethUpper doesn't move).
+
+function setMorph(meshes, name, value) {
+    meshes.forEach((mesh) => {
+        if (!mesh || !mesh.morphTargetDictionary) return
+        const index = mesh.morphTargetDictionary[name]
+        if (index !== undefined) {
+            mesh.morphTargetInfluences[index] = value
+        }
+    })
+}
+
+
+// ======================
+// Live pose tuner (press P in the browser)
+// ======================
+//
+// Since I can't see your render from here, this lets YOU find the right
+// rotation values interactively instead of me guessing axes blindly.
+//
+//   P              toggle the tuner panel on/off (also freezes idle sway
+//                  so your edits aren't overwritten every frame)
+//   1 / 2 / 3 / 4 / 5   select: left upper arm / right upper arm /
+//                       left forearm / right forearm / right hand
+//   Arrow Left/Right   adjust Z rotation
+//   Arrow Up/Down      adjust X rotation
+//   Shift + Up/Down    adjust Y rotation
+//   R              reset selected bone to its original bind rotation
+//
+// For the hand specifically: select it with 5, then rotate it until the
+// palm faces the camera the way you want at full wave height. Send me
+// that rotation.set(...) line and I'll use it as the gesture's PEAK
+// value (not a resting pose) — the wave will ease from resting up to
+// exactly that rotation, then back down.
+
+let tunerActive = false
+let tunerSelection = 'leftUpperArm'
+const tunerBindRotation = {} // original T-pose rotation, for the R reset key
+
+const TUNER_BONES = {
+    '1': 'leftUpperArm',
+    '2': 'rightUpperArm',
+    '3': 'leftLowerArm',
+    '4': 'rightLowerArm',
+    '5': 'rightHand'
+}
+
+function buildTunerPanel() {
+    const panel = document.createElement('div')
+    panel.id = 'pose-tuner'
+    panel.style.cssText = `
+        position: fixed; bottom: 100px; right: 24px; z-index: 20;
+        font-family: 'JetBrains Mono', monospace; font-size: 12px;
+        background: rgba(16,32,31,0.88); color: #7fd0d0;
+        padding: 12px 14px; border-radius: 10px; line-height: 1.6;
+        white-space: pre; display: none; max-width: 340px;
+    `
+    document.body.appendChild(panel)
+    return panel
+}
+
+const tunerPanel = buildTunerPanel()
+
+function updateTunerPanel() {
+    const bone = idleBones[tunerSelection]
+    if (!bone) {
+        tunerPanel.textContent = `No bone found for "${tunerSelection}"`
+        return
+    }
+    const r = bone.rotation
+    tunerPanel.textContent =
+`POSE TUNER — press P to close
+selected: ${tunerSelection}  (1-4 to switch)
+x: ${r.x.toFixed(2)}  y: ${r.y.toFixed(2)}  z: ${r.z.toFixed(2)}
+
+← → z-axis   ↑ ↓ x-axis   shift+↑↓ y-axis   R reset
+
+paste into setIdlePose():
+bones.${tunerSelection}.rotation.set(${r.x.toFixed(2)}, ${r.y.toFixed(2)}, ${r.z.toFixed(2)})`
+}
+
+window.addEventListener('keydown', (e) => {
+    // Don't hijack typing in the chat input
+    if (document.activeElement && document.activeElement.id === 'chat-input') return
+
+    if (e.key === 'p' || e.key === 'P') {
+        tunerActive = !tunerActive
+        tunerPanel.style.display = tunerActive ? 'block' : 'none'
+        if (tunerActive) updateTunerPanel()
+        return
+    }
+
+    if (!tunerActive) return
+
+    if (TUNER_BONES[e.key]) {
+        tunerSelection = TUNER_BONES[e.key]
+        updateTunerPanel()
+        return
+    }
+
+    const bone = idleBones[tunerSelection]
+    if (!bone) return
+
+    const step = 0.05
+
+    if (!(tunerSelection in tunerBindRotation)) {
+        tunerBindRotation[tunerSelection] = bone.rotation.clone()
+    }
+
+    if (e.key === 'ArrowLeft') bone.rotation.z -= step
+    else if (e.key === 'ArrowRight') bone.rotation.z += step
+    else if (e.key === 'ArrowUp' && !e.shiftKey) bone.rotation.x -= step
+    else if (e.key === 'ArrowDown' && !e.shiftKey) bone.rotation.x += step
+    else if (e.key === 'ArrowUp' && e.shiftKey) bone.rotation.y -= step
+    else if (e.key === 'ArrowDown' && e.shiftKey) bone.rotation.y += step
+    else if (e.key === 'r' || e.key === 'R') {
+        bone.rotation.copy(tunerBindRotation[tunerSelection])
+    } else {
+        return
+    }
+
+    e.preventDefault()
+    updateTunerPanel()
+})
+
+
+// ======================
 // Idle blinking (natural, randomized)
 // ======================
 
-function startIdleBlinking(vrm) {
-    if (!vrm.expressionManager) return
+function startIdleBlinking() {
+    if (!headMesh && !eyelashMesh) return
+
+    const faces = [headMesh, eyelashMesh]
 
     function blinkLoop() {
         const nextBlinkIn = 2000 + Math.random() * 4000 // every 2-6s
 
         setTimeout(() => {
-            vrm.expressionManager.setValue("blink", 1)
+            setMorph(faces, "eyeBlinkLeft", 1)
+            setMorph(faces, "eyeBlinkRight", 1)
 
             setTimeout(() => {
-                vrm.expressionManager.setValue("blink", 0)
+                setMorph(faces, "eyeBlinkLeft", 0)
+                setMorph(faces, "eyeBlinkRight", 0)
                 blinkLoop()
             }, 150)
         }, nextBlinkIn)
@@ -545,28 +726,42 @@ function pickVoice() {
     )
 }
 
-let mouthOpen = false
-let mouthInterval = null
+// Driven per-frame from animate() via updateLipSync(), not a setInterval —
+// that's what makes it smooth instead of a hard on/off flicker.
+let isSpeaking = false
+let currentJaw = 0
 
-function startLipSync(vrm) {
-    if (!vrm || !vrm.expressionManager) return
-
-    mouthInterval = setInterval(() => {
-        mouthOpen = !mouthOpen
-        const value = mouthOpen ? 0.6 + Math.random() * 0.3 : 0
-        // Most VRM avatars expose "aa" as an open-mouth viseme
-        vrm.expressionManager.setValue("aa", value)
-    }, 110)
+function startLipSync() {
+    isSpeaking = true
 }
 
-function stopLipSync(vrm) {
-    if (mouthInterval) {
-        clearInterval(mouthInterval)
-        mouthInterval = null
+function stopLipSync() {
+    isSpeaking = false
+}
+
+function updateLipSync(elapsed) {
+    if (!headMesh) return
+
+    let target = 0
+
+    if (isSpeaking) {
+        // Two layered sine waves at different speeds so it doesn't look
+        // like a metronome — and capped low on purpose. This was too
+        // extreme before (toggling up to 0.8 instantly); real speech
+        // barely opens the jaw past ~0.3-0.35 most of the time.
+        const wave =
+            (Math.sin(elapsed * 9) * 0.5 + 0.5) * 0.22 +
+            (Math.sin(elapsed * 17 + 1) * 0.5 + 0.5) * 0.08
+        target = Math.min(0.08 + wave, 0.35)
     }
-    if (vrm && vrm.expressionManager) {
-        vrm.expressionManager.setValue("aa", 0)
-    }
+
+    // Smooth toward the target instead of snapping — removes the "wild"
+    // flicker and makes it read as a mouth moving, not a switch flipping.
+    currentJaw += (target - currentJaw) * 0.25
+
+    // jawOpen exists on both AvatarHead and AvatarTeethLower — move both
+    // together so the teeth don't lag behind the jaw visually
+    setMorph([headMesh, teethLowerMesh], "jawOpen", currentJaw)
 }
 
 function speak(text) {
@@ -584,13 +779,13 @@ function speak(text) {
     speech.pitch = 1.5
     speech.rate = 1.05
 
-    speech.onstart = () => startLipSync(currentVrm)
+    speech.onstart = () => startLipSync()
     speech.onend = () => {
-        stopLipSync(currentVrm)
+        stopLipSync()
         setSubtitle("")
     }
     speech.onerror = () => {
-        stopLipSync(currentVrm)
+        stopLipSync()
         setSubtitle("")
     }
 
@@ -708,19 +903,19 @@ const clock = new THREE.Clock()
 function animate() {
     requestAnimationFrame(animate)
 
-    const delta = clock.getDelta()
+    clock.getDelta()
     const elapsed = clock.getElapsedTime()
 
-    if (currentVrm) {
-        // Bone rotations must be set BEFORE vrm.update() — that's what
-        // syncs the normalized bone nodes to the actual skeleton.
-        applyIdleSway(elapsed)
-        applyActiveGesture()
+    if (currentAvatarRoot) {
+        if (!tunerActive) {
+            applyIdleSway(elapsed)
+            applyActiveGesture()
+        }
 
-        currentVrm.update(delta)
+        updateLipSync(elapsed)
 
         // very small breathing
-        currentVrm.scene.position.y = Math.sin(Date.now() * 0.0015) * 0.005
+        currentAvatarRoot.position.y = Math.sin(Date.now() * 0.0015) * 0.005
     }
 
     renderer.render(scene, camera)
